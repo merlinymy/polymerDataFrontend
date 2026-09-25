@@ -18,9 +18,15 @@ import {
   type NumericColumnId,
 } from "@/data";
 import { applyAxisScale, type AxisScale } from "@/lib/log-axis";
-import type { CategoricalPoint, ContinuousPoint, ScatterSeriesInput } from "@/components/charts";
+import type {
+  CategoricalPoint,
+  ContinuousPoint,
+  ImportedPoint,
+  ScatterSeriesInput,
+} from "@/components/charts";
 import { MAX_CATEGORICAL_SLOTS } from "@/styles/chart-palette";
 import { axisTitle, getColumnMeta } from "./columns";
+import type { ImportedDataset } from "@/components/import";
 
 // ---------------------------------------------------------------------------
 // Log-axis hazard — DATA-SPEC.md §3
@@ -181,6 +187,91 @@ export function buildExplorePoints(
 }
 
 // ---------------------------------------------------------------------------
+// User-imported rows (`@/components/import`) — same axis rules as the
+// dataset, but never filtered
+// ---------------------------------------------------------------------------
+
+/** One column of an imported file, or `undefined` if the file lacked it. */
+function importedColumn(
+  imported: ImportedDataset,
+  columnId: string,
+): readonly AxisRawValue[] | undefined {
+  if (getColumnMeta(columnId)?.kind === "categorical") {
+    return imported.categorical[columnId as CategoricalColumnId];
+  }
+  return imported.numeric[columnId as NumericColumnId];
+}
+
+export interface ImportedPointsResult {
+  readonly points: readonly ImportedPoint[];
+  readonly totalCount: number;
+  /** Axes whose column the file doesn't have at all. */
+  readonly missingAxes: readonly ("X" | "Y")[];
+}
+
+/**
+ * Imported rows as overlay points for the current view. The dataset
+ * filters deliberately don't apply — they narrow the literature, and the
+ * user's own rows stay visible against whatever slice they pick. Only the
+ * same `plottableXY` gate as the dataset does: missing values and
+ * non-positive values on a log axis never plot.
+ */
+export function buildImportedPoints(
+  imported: ImportedDataset,
+  xColumnId: string,
+  xScale: AxisScale,
+  yColumnId: string,
+  yScale: AxisScale,
+  colorColumnId: string,
+): ImportedPointsResult {
+  const xColumn = importedColumn(imported, xColumnId);
+  const yColumn = importedColumn(imported, yColumnId);
+  const colorColumn = importedColumn(imported, colorColumnId);
+
+  const missingAxes: ("X" | "Y")[] = [];
+  if (!xColumn) missingAxes.push("X");
+  if (!yColumn) missingAxes.push("Y");
+
+  const points: ImportedPoint[] = [];
+  if (xColumn && yColumn) {
+    for (let row = 0; row < imported.rowCount; row++) {
+      const xy = plottableXY(xColumn, yColumn, row, xScale, yScale);
+      if (!xy) continue;
+      points.push({ x: xy.x, y: xy.y, rowNumber: row + 1, colorValue: colorColumn?.[row] ?? null });
+    }
+  }
+
+  return { points, totalCount: imported.rowCount, missingAxes };
+}
+
+/**
+ * Why some or all imported rows aren't on the chart, or `null` when every
+ * row is. Mirrors the log-axis notice: the plot never hides user data
+ * without saying so.
+ */
+export function importedNoticeMessage(
+  result: ImportedPointsResult,
+  xColumnId: string,
+  yColumnId: string,
+): string | null {
+  if (result.missingAxes.length > 0) {
+    const labels = result.missingAxes.map(
+      (axis) => `"${getColumnMeta(axis === "X" ? xColumnId : yColumnId)?.label ?? ""}"`,
+    );
+    const missing = labels.length === 1 ? `${labels[0]} column` : `${labels.join(" or ")} columns`;
+    return `The imported file has no ${missing}, so its rows can't be placed on these axes.`;
+  }
+
+  const plotted = result.points.length;
+  const unplottable = result.totalCount - plotted;
+  if (unplottable === 0) return null;
+  return (
+    `${plotted} of ${result.totalCount} imported rows plotted: ${unplottable} ` +
+    `${unplottable === 1 ? "has" : "have"} a missing X or Y value, or one a log axis can't show (≤ 0).`
+  );
+}
+
+// ---------------------------------------------------------------------------
 // High-cardinality color columns — CHART-PALETTE.md's overflow rule
 // ---------------------------------------------------------------------------
 
@@ -267,7 +358,10 @@ export type ExploreEmptyReason = "no-rows-match-filters" | "no-plottable-points"
  * zero-row filter result is a more specific, more actionable explanation
  * than "zero of zero rows plotted".
  */
-export function exploreEmptyReason(filteredCount: number, plottedCount: number): ExploreEmptyReason {
+export function exploreEmptyReason(
+  filteredCount: number,
+  plottedCount: number,
+): ExploreEmptyReason {
   if (filteredCount === 0) return "no-rows-match-filters";
   if (plottedCount === 0) return "no-plottable-points";
   return null;
